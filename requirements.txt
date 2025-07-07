@@ -1,3 +1,12 @@
+# For Kafka and Reddit
+praw
 kafka-python
-feedparser
-textblob
+python-dotenv
+
+# For Spark ML and data handling
+pyspark
+scikit-learn
+pandas
+nltk
+tensorflow
+matplotlib

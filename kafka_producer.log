@@ -1,0 +1,8 @@
+2025-07-07 18:02:52,944 - __main__ - INFO - ==================================================
+2025-07-07 18:02:52,945 - __main__ - INFO - Starting Reddit Kafka Producer
+2025-07-07 18:02:52,945 - __main__ - INFO - ==================================================
+2025-07-07 18:02:52,946 - __main__ - INFO - Kafka Bootstrap Servers: localhost:9092
+2025-07-07 18:02:52,946 - __main__ - INFO - Kafka Topic: reddit-sentiment
+2025-07-07 18:02:52,947 - __main__ - INFO - Reddit API credentials validated successfully
+2025-07-07 18:02:52,951 - __main__ - ERROR - Unexpected error creating producer: Libraries for snappy compression codec not found
+2025-07-07 18:02:52,952 - __main__ - ERROR - Failed to create Kafka producer: Libraries for snappy compression codec not found
