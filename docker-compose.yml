@@ -60,3 +60,16 @@ services:
     environment:
       SPARK_MODE: master
       SPARK_MASTER_URL: spark://spark:7077
+
+   # --- ADD THIS NEW SERVICE ---
+  spark-worker:
+    image: bitnami/spark:3.4.2
+    depends_on:
+      - spark # Ensures the master is started first
+    volumes:
+      - ./:/opt/bitnami/spark/work
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark:7077 # Tells the worker where to find the master
+      SPARK_WORKER_CORES: 2  # Number of cores the worker can use
+      SPARK_WORKER_MEMORY: 2g # Amount of memory the worker can use
