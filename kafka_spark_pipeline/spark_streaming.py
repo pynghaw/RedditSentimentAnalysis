@@ -1,97 +1,142 @@
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' # Suppress TensorFlow INFO and WARNING messages
+
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import from_json, col, udf
-from pyspark.sql.types import StructType, StringType, IntegerType, FloatType
-import pickle
+from pyspark.sql.functions import udf, col, from_json
+from pyspark.sql.types import StringType, StructType, StructField, IntegerType, FloatType
+import re
+import joblib
+import numpy as np
 import tensorflow as tf
 from tensorflow.keras.preprocessing.sequence import pad_sequences
-import numpy as np
 
-# --- 1. Load the pre-trained model AND tokenizer ---
-# Define the max length of sequences from your training phase
-MAX_SEQUENCE_LENGTH = 100 # IMPORTANT: Use the same value you used for training!
+# --- Configuration ---
+KAFKA_TOPIC = "reddit-comments"
+KAFKA_SERVER = "kafka:29092"
+ELASTICSEARCH_NODE = "elasticsearch"
+ELASTICSEARCH_PORT = "9200"
+ELASTICSEARCH_INDEX = "reddit-comments-lstm"
+CHECKPOINT_LOCATION = "/tmp/spark_checkpoint_reddit_lstm"
 
-def load_files():
-    # Load the Keras model
-    model = tf.keras.models.load_model("/app/artifacts/lstm_sentiment_model.h5")
-    
-    # Load the tokenizer
-    with open("/app/artifacts/tokenizer.pkl", "rb") as f:
-        tokenizer = pickle.load(f)
-        
-    return model, tokenizer
+# Define a maximum sequence length for padding.
+# This should match the length used during model training.
+MAX_SEQUENCE_LENGTH = 150 
 
-# Broadcast the model and tokenizer to all worker nodes
-model, tokenizer = load_files()
+# --- Model Loading and Broadcasting ---
+# Load the tokenizer and the Keras model on the driver
+tokenizer = joblib.load("/opt/bitnami/spark/work/models/tokenizer.pkl")
+model = tf.keras.models.load_model("/opt/bitnami/spark/work/models/lstm_sentiment_model.h5")
 
-# --- 2. Define the Prediction UDF for LSTM ---
-# A User Defined Function (UDF) to apply the LSTM model
-def predict_sentiment_lstm(text):
-    if text is None:
-        return "neutral"
-        
-    try:
-        # 1. Tokenize the text using the loaded tokenizer
-        sequence = tokenizer.texts_to_sequences([text])
-        
-        # 2. Pad the sequence to the same length used during training
-        padded_sequence = pad_sequences(sequence, maxlen=MAX_SEQUENCE_LENGTH)
-        
-        # 3. Predict the sentiment
-        prediction = model.predict(padded_sequence)
-        
-        # 4. Interpret the result (assuming 3 output neurons for pos, neg, neu)
-        #    and return the label with the highest probability.
-        labels = ['negative', 'neutral', 'positive'] # Make sure this order matches your model's training
-        return labels[np.argmax(prediction)]
-        
-    except Exception as e:
-        return "error"
-
-# Register the function as a UDF
-sentiment_udf = udf(predict_sentiment_lstm, StringType())
-
-# --- 3. Initialize Spark Session ---
-print("Initializing Spark Session for LSTM model...")
+# Initialize Spark Session
 spark = SparkSession.builder \
-    .appName("RedditSentimentAnalysisLSTM") \
-    .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,org.elasticsearch:elasticsearch-spark-30_2.12:8.12.0") \
+    .appName("RedditSentimentLSTM") \
+    .config("spark.jars.packages",
+            "org.apache.spark:spark-sql-kafka-0-10_2.12:3.4.2,"
+            "org.elasticsearch:elasticsearch-spark-30_2.12:8.13.4") \
     .getOrCreate()
 
-spark.sparkContext.setLogLevel("WARN")
-print("Spark Session Initialized.")
+spark.sparkContext.setLogLevel("ERROR")
 
-# --- 4. Define Schema and Read from Kafka ---
-schema = StructType() \
-    .add("post_id", StringType()) \
-    .add("post_title", StringType()) \
-    .add("comment_id", StringType()) \
-    .add("comment_body", StringType()) \
-    .add("comment_score", IntegerType()) \
-    .add("created_utc", FloatType())
+# Broadcast the tokenizer and the model's weights to all worker nodes
+tokenizer_broadcast = spark.sparkContext.broadcast(tokenizer)
+model_weights_broadcast = spark.sparkContext.broadcast(model.get_weights())
 
-df_raw = spark.readStream \
+# --- Schema Definition for Kafka Messages ---
+schema = StructType([
+    StructField("post_id", StringType(), True),
+    StructField("post_title", StringType(), True),
+    StructField("comment_id", StringType(), True),
+    StructField("comment_body", StringType(), True),
+    StructField("comment_score", IntegerType(), True),
+    StructField("created_utc", FloatType(), True)
+])
+
+# --- Text Cleaning Function ---
+def clean_text(text):
+    if text is None:
+        return ""
+    text = str(text).lower()
+    text = re.sub(r"https[^\s]+|www[^\s]+", '', text)  # Remove URLs
+    text = re.sub(r'[^a-zA-Z0-9\s]', '', text)       # Remove special characters/emojis
+    text = re.sub(r'\s+', ' ', text).strip()         # Normalize whitespace
+    return text
+
+clean_text_udf = udf(clean_text, StringType())
+
+
+# --- Sentiment Prediction UDF for LSTM Model ---
+def predict_sentiment_lstm(text_series):
+    # This function is designed to work with Pandas UDFs for efficiency
+    # but a standard UDF is used here for simplicity.
+    
+    # 1. Get the broadcasted tokenizer and weights
+    local_tokenizer = tokenizer_broadcast.value
+    local_weights = model_weights_broadcast.value
+    
+    # 2. Re-create the model architecture and set the broadcasted weights
+    #    This avoids serializing the entire model object.
+    local_model = tf.keras.models.load_model("/opt/bitnami/spark/work/models/lstm_sentiment_model.h5")
+    local_model.set_weights(local_weights)
+
+    predictions = []
+    for text in text_series:
+        if not text or len(text.strip()) < 2:
+            predictions.append("NEUTRAL")
+            continue
+        try:
+            # 3. Tokenize and pad the text
+            sequence = local_tokenizer.texts_to_sequences([text])
+            padded_sequence = pad_sequences(sequence, maxlen=MAX_SEQUENCE_LENGTH)
+
+            # 4. Make a prediction
+            prediction_prob = local_model.predict(padded_sequence, verbose=0)[0][0]
+
+            # 5. Interpret the prediction
+            if prediction_prob > 0.5:
+                predictions.append("POSITIVE")
+            else:
+                predictions.append("NEGATIVE")
+        except Exception as e:
+            print(f"Prediction error: {e}")
+            predictions.append("ERROR")
+            
+    return predictions
+
+# We need to wrap the function slightly for a standard UDF
+def predict_sentiment(text):
+    return predict_sentiment_lstm([text])[0]
+
+predict_udf = udf(predict_sentiment, StringType())
+
+
+# --- Spark Streaming Pipeline ---
+# 1. Read from Kafka
+raw_df = spark.readStream \
     .format("kafka") \
-    .option("kafka.bootstrap.servers", "kafka:29092") \
-    .option("subscribe", "reddit-stream") \
+    .option("kafka.bootstrap.servers", KAFKA_SERVER) \
+    .option("subscribe", KAFKA_TOPIC) \
     .option("startingOffsets", "latest") \
     .load()
 
-# --- 5. Process Data and Predict Sentiment ---
-df_parsed = df_raw.selectExpr("CAST(value AS STRING) as json_str") \
-    .select(from_json(col("json_str"), schema).alias("data")) \
-    .select("data.*")
+# 2. Decode the Kafka message and parse the JSON
+json_df = raw_df.selectExpr("CAST(value AS STRING)")
+parsed_df = json_df.select(from_json(col("value"), schema).alias("data")).select("data.*")
 
-df_with_sentiment = df_parsed.withColumn("sentiment", sentiment_udf(col("comment_body")))
+# 3. Clean the comment text
+clean_df = parsed_df.withColumn("clean_comment", clean_text_udf(col("comment_body")))
 
-# --- 6. Write to Elasticsearch ---
-print("Starting to write stream to Elasticsearch...")
-query = df_with_sentiment.writeStream \
+# 4. Predict sentiment using the LSTM model
+result_df = clean_df.withColumn("sentiment", predict_udf(col("clean_comment")))
+
+
+# --- Write to Elasticsearch ---
+es_query = result_df.writeStream \
     .outputMode("append") \
     .format("org.elasticsearch.spark.sql") \
-    .option("es.resource", "reddit_sentiment_lstm/comment") \
-    .option("es.nodes", "elasticsearch") \
-    .option("es.port", "9200") \
-    .option("checkpointLocation", "/tmp/check_point_reddit_lstm") \
+    .option("es.nodes", ELASTICSEARCH_NODE) \
+    .option("es.port", ELASTICSEARCH_PORT) \
+    .option("checkpointLocation", CHECKPOINT_LOCATION) \
+    .option("es.resource", ELASTICSEARCH_INDEX) \
     .start()
 
-query.awaitTermination()
+es_query.awaitTermination()
