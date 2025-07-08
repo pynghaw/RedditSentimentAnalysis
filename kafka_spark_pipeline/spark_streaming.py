@@ -123,10 +123,26 @@ raw_df = spark.readStream \
 json_df = raw_df.selectExpr("CAST(value AS STRING)")
 parsed_df = json_df.select(from_json(col("value"), schema).alias("data")).select("data.*")
 
+# Add this to see the raw JSON from Kafka in your console
+json_df.writeStream \
+    .outputMode("append") \
+    .format("console") \
+    .start()
+
+parsed_df = json_df.select(from_json(col("value"), schema).alias("data")).select("data.*")
+
 # 3. Clean the comment text
+print("🚀 Cleaning comments...")
 clean_df = parsed_df.withColumn("clean_comment", clean_text_udf(col("comment_body")))
+clean_df.writeStream \
+    .outputMode("append") \
+    .format("console") \
+    .start()
+
+print("🚀 Streaming to console started...")
 
 # 4. Predict sentiment using the LSTM model
+print("🚀 Predicting sentiment...")
 result_df = clean_df.withColumn("sentiment", predict_udf(col("clean_comment")))
 
 print("🚀 Starting Spark writeStream to Elasticsearch...")
@@ -141,6 +157,5 @@ es_query = result_df.writeStream \
     .start()
     
 print("✅ writeStream started. Awaiting termination...")
-
 
 es_query.awaitTermination()
