@@ -110,6 +110,7 @@ predict_udf = udf(predict_sentiment, StringType())
 
 
 # --- Spark Streaming Pipeline ---
+print("🚀 Reading from Kafka...")
 # 1. Read from Kafka
 raw_df = spark.readStream \
     .format("kafka") \
@@ -128,7 +129,7 @@ clean_df = parsed_df.withColumn("clean_comment", clean_text_udf(col("comment_bod
 # 4. Predict sentiment using the LSTM model
 result_df = clean_df.withColumn("sentiment", predict_udf(col("clean_comment")))
 
-
+print("🚀 Starting Spark writeStream to Elasticsearch...")
 # --- Write to Elasticsearch ---
 es_query = result_df.writeStream \
     .outputMode("append") \
@@ -138,5 +139,8 @@ es_query = result_df.writeStream \
     .option("checkpointLocation", CHECKPOINT_LOCATION) \
     .option("es.resource", ELASTICSEARCH_INDEX) \
     .start()
+    
+print("✅ writeStream started. Awaiting termination...")
+
 
 es_query.awaitTermination()
